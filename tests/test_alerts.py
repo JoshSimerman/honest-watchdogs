@@ -485,3 +485,128 @@ def test_cli_json_puts_the_report_on_stdout(monkeypatch, capsys) -> None:
     assert alerts.main(["--json", "x"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["deliveries"][0]["status"] == "delivered"
+
+
+# --------------------------------------------------------------------------- the loop never aborts
+#
+# Every sink is attempted, whatever happens to the bookkeeping around it. A receipt that cannot
+# be written anywhere, a dedupe file that cannot be opened, a sink that returns garbage, or a
+# closed stderr must each be REPORTED, never allowed to stop the remaining sinks.
+
+
+def _unwritable(tmp_path: Path, name: str) -> Path:
+    """A path whose parent is a regular file, so every write under it raises OSError."""
+    blocker = tmp_path / f"{name}-is-a-file"
+    blocker.write_text("x")
+    return blocker / "dir"
+
+
+def test_a_lost_receipt_never_stops_the_remaining_sinks(tmp_path, capsys) -> None:
+    sinks = [RecordingSink(f"s{i}") for i in range(3)]
+    cfg = alerts.AlertConfig(sinks=tuple(sinks), receipt_dir=_unwritable(tmp_path, "primary"),
+                             fallback_receipt_dir=_unwritable(tmp_path, "fallback"))
+
+    result = alerts.alert("critical", "unit", "disk full", config=cfg)
+
+    assert [len(s.calls) for s in sinks] == [1, 1, 1], "a receipt failure aborted delivery"
+    assert result.delivered, "delivery itself succeeded and must say so"
+    assert not result.receipts_ok
+    assert all(d.receipt_error for d in result.deliveries)
+    err = capsys.readouterr().err
+    assert err.count("ALERT RECEIPT LOST") == 3
+    assert '"sink":"s2"' in err, "the lost receipt itself must reach stderr, the last record left"
+
+
+def test_append_receipt_reports_a_double_failure_instead_of_raising(tmp_path, capsys) -> None:
+    landed = alerts.append_receipt(_unwritable(tmp_path, "p") / "x-alerts.jsonl", {"probe": "lost"},
+                                   timeout=5.0, fallback_dir=_unwritable(tmp_path, "f"))
+    assert landed is None
+    err = capsys.readouterr().err
+    assert "ALERT RECEIPT LOST" in err and '"probe":"lost"' in err
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX only")
+def test_a_blocking_fallback_is_bounded_too(tmp_path) -> None:
+    """Both destinations wedged. Run in a subprocess so an unbounded write fails, not hangs."""
+    import subprocess
+    import sys
+
+    primary = tmp_path / "x-alerts.jsonl"
+    fallback = tmp_path / "fb"
+    fallback.mkdir()
+    os.mkfifo(primary)
+    os.mkfifo(fallback / "x-alerts.jsonl")
+    code = (
+        "import sys; from pathlib import Path; from honest_watchdogs import alerts; "
+        f"landed = alerts.append_receipt(Path({str(primary)!r}), {{'probe': 'both wedged'}}, "
+        f"timeout=0.5, fallback_dir=Path({str(fallback)!r})); "
+        "sys.exit(0 if landed is None else 1)"
+    )
+    try:
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              timeout=15)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the fallback receipt write hung: it is not bounded by the deadline")
+    assert done.returncode == 0, done.stderr
+    assert "ALERT RECEIPT LOST" in done.stderr
+
+
+def test_watchdog_alert_exits_1_when_a_receipt_is_lost(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("WATCHDOG_RECEIPT_DIR", str(_unwritable(tmp_path, "p")))
+    monkeypatch.setenv("WATCHDOG_FALLBACK_RECEIPT_DIR", str(_unwritable(tmp_path, "f")))
+    assert alerts.main(["--json", "path check"]) == alerts.EXIT_FINDINGS
+    report = json.loads(capsys.readouterr().out)
+    assert report["deliveries"][0]["status"] == "delivered"
+    assert report["deliveries"][0]["receipt_error"]
+
+
+def test_a_sink_returning_garbage_is_a_failed_delivery_and_later_sinks_still_run(tmp_path) -> None:
+    class Garbage:
+        name, live = "garbage", False
+
+        def deliver(self, alert):
+            return None
+
+    after = RecordingSink("after")
+    result = alerts.alert("warn", "unit", "s", config=_config(tmp_path, Garbage(), after))
+    assert len(after.calls) == 1
+    bad = next(d for d in result.deliveries if d.sink == "garbage")
+    assert not bad.success and "DeliveryOutcome" in bad.failure_reason
+    assert not result.success
+
+
+def test_an_unusable_dedupe_state_fails_toward_sending(tmp_path, capsys) -> None:
+    sinks = [RecordingSink("a"), RecordingSink("b")]
+    cfg = _config(tmp_path, *sinks, dedup_state_path=_unwritable(tmp_path, "d") / "dedup.json")
+
+    result = alerts.alert("critical", "unit", "s", dedupe_key="k", config=cfg)
+
+    assert [len(s.calls) for s in sinks] == [1, 1]
+    assert result.delivered and result.dedupe_error
+    assert "dedupe" in capsys.readouterr().err
+
+
+def test_a_failed_dedupe_confirm_still_returns_the_result(tmp_path, monkeypatch, capsys) -> None:
+    def broken(*args, **kwargs):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(alerts, "_dedup_confirm", broken)
+    sink = RecordingSink()
+    result = alerts.alert("critical", "unit", "s", dedupe_key="k", config=_config(tmp_path, sink))
+    assert result.delivered and "disk gone" in result.dedupe_error
+    assert "disk gone" in capsys.readouterr().err
+
+
+def test_a_closed_stderr_cannot_stop_delivery(tmp_path, monkeypatch) -> None:
+    import io
+    import sys
+
+    closed = io.StringIO()
+    closed.close()
+    monkeypatch.setattr(sys, "stderr", closed)
+    sinks = [RecordingSink("a"), RecordingSink("b")]
+    cfg = alerts.AlertConfig(sinks=tuple(sinks), receipt_dir=_unwritable(tmp_path, "p"),
+                             fallback_receipt_dir=_unwritable(tmp_path, "f"))
+    result = alerts.alert("critical", "unit", "s", config=cfg)
+    assert [len(s.calls) for s in sinks] == [1, 1]
+    assert result.delivered and not result.receipts_ok

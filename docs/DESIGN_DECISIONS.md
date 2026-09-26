@@ -113,7 +113,7 @@ the receipts will show every attempt and why it failed.
 
 ---
 
-## ADR-006: Receipts are mandatory, bounded, and never dropped
+## ADR-006: Receipts are mandatory, bounded, and never silently dropped
 
 **Context.** "The alert was sent" usually means a function returned. The receipt log is how you
 answer "did anyone get told?" after the fact. But if the receipt directory is on a network
@@ -124,11 +124,18 @@ something to report.
 under a `SIGALRM` deadline; on timeout or error the line goes to a local fallback directory,
 marked degraded with the intended path and the reason, plus a stderr warning. The fallback is
 triggered by attempting the write, never by an existence check, because permission layers can
-allow metadata while denying content.
+allow metadata while denying content. The fallback write has the same deadline. If it fails too,
+the full receipt line is printed to stderr under `ALERT RECEIPT LOST`, the delivery carries a
+`receipt_error`, and `watchdog-alert` exits 1. A receipt failure never raises out of the delivery
+loop: the remaining sinks are always attempted, because a receipt is bookkeeping about a page and
+must not prevent the next one.
 
 **Consequences.** `SIGALRM` bounds the write only on the main thread; off it the write is
 unbounded, and that is documented rather than disguised. Receipts persist only opted-in scalar
-context, so they can be kept longer and shared more widely than alert bodies.
+context, so they can be kept longer and shared more widely than alert bodies. A delivered page
+whose receipt was lost still counts as delivered for latching (`result.success`), so the human is
+not paged again; `result.receipts_ok` reports the loss separately. With stderr closed as well,
+the receipt is gone, and only `receipt_error` on the result records that it was.
 
 ---
 

@@ -3,16 +3,18 @@
 `honest_watchdogs.alerts` is the delivery layer every instrument uses. It is also a command,
 `watchdog-alert`, which sends one alert through the configured sinks: run it before you trust any
 detector that depends on it. It prints its delivery report to stderr, or to stdout with `--json`,
-and exits 0 when every sink delivered, 1 when any failed, 2 when the configuration is invalid.
+and exits 0 when every sink delivered and every receipt was written to a file, 1 when any sink
+failed or any receipt was lost, 2 when the configuration is invalid.
 
 ## What it guarantees
 
 | Guarantee | Mechanism |
 |---|---|
+| Every sink is attempted | Nothing in the delivery loop raises. A sink that raises or returns something other than a `DeliveryOutcome` is a failed delivery; a receipt or dedupe-file failure is recorded on the result and printed to stderr; a closed stderr is ignored. The next sink is always tried |
 | Every attempt leaves evidence | One JSONL receipt line per sink per alert, in `<receipt_dir>/<YYYY-MM-DD>-alerts.jsonl` |
 | "Sent" is distinguished from "delivered" | A receipt's `status` is `delivered` only when the sink acknowledged (for a webhook: HTTP 2xx). Otherwise `failed`, with `failure_reason` and `http_status` |
-| A wedged receipt directory cannot hang the watchdog | The receipt write runs under a `SIGALRM` deadline; on timeout or `OSError` it goes to a local fallback directory with `receipt_degraded: true` and the intended path |
-| A receipt is never dropped | The deadline changes the destination, never whether to record |
+| A wedged receipt directory cannot hang the watchdog | The receipt write runs under a `SIGALRM` deadline; on timeout or `OSError` it goes to a local fallback directory with `receipt_degraded: true` and the intended path. The fallback write has the same deadline |
+| A receipt is never dropped silently | The deadline changes the destination, never whether to record. If the fallback fails too, the full receipt line goes to stderr under `ALERT RECEIPT LOST`, the delivery carries `receipt_error`, and `result.receipts_ok` is False |
 | A failed page stays retryable | Dedupe keys are claimed, confirmed only when every sink delivered, released otherwise |
 | A crashed sender cannot suppress a key for long | Claims expire after `CLAIM_TTL_SECONDS` (30s) |
 | A test suite cannot page a human | Under pytest, live sinks are forced to dry-run with a loud stderr message, unless `HONEST_WATCHDOGS_ALLOW_LIVE=1` |
@@ -27,19 +29,77 @@ flowchart TD
     B -- no --> C{dedupe key active?<br/>claim or confirmed}
     C -- yes --> S[record dedup_skipped receipt per sink]
     C -- no --> D[claim key with owner token]
+    C -- "dedupe file unusable" --> E
     D --> E[for each sink]
     B -- yes --> E
     E --> F{live sink and<br/>live delivery blocked?}
     F -- yes --> G[dry_run delivery]
-    F -- no --> H[sink.deliver]
+    F -- no --> H["sink.deliver<br/>(raise or garbage = failed)"]
     G --> R[append receipt, bounded by deadline]
     H --> R
-    R -- write blocked or failed --> FB[append to local fallback,<br/>receipt_degraded=true, warn on stderr]
-    R --> I{all sinks delivered?}
-    FB --> I
+    R -- write blocked or failed --> FB[append to local fallback,<br/>same deadline, warn on stderr]
+    FB -- also fails --> L[receipt line to stderr,<br/>ALERT RECEIPT LOST, receipt_error]
+    R --> N{more sinks?}
+    FB --> N
+    L --> N
+    N -- yes --> E
+    N -- no --> I{all sinks delivered?}
     I -- yes --> J[confirm claim: key suppressed for the window]
     I -- no --> K[release claim: next attempt retries]
 ```
+
+## Checking the alert path
+
+`watchdog-alert` is the positive control for the alert path. A webhook that answers 503 is a
+failed delivery, the receipt says so, and the command exits 1:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as operator
+    participant CLI as watchdog-alert
+    participant A as alerts.send_alert
+    participant D as dedupe table
+    participant S as sink (webhook)
+    participant R as receipts JSONL
+    Op->>CLI: --severity critical "path check"
+    CLI->>A: alert(...)
+    A->>D: claim key (owner token, 30s TTL)
+    A->>S: deliver(alert)
+    S-->>A: HTTP 503
+    A->>R: append receipt, status=failed (SIGALRM deadline)
+    alt every sink delivered
+        A->>D: confirm: suppressed for the window
+    else any sink failed
+        A->>D: release: next run retries
+    end
+    A-->>CLI: AlertResult
+    CLI-->>Op: delivery report, exit 1
+```
+
+![watchdog-alert with no configuration delivers to stderr and exits 0; pointed at a webhook that answers 503 it exits 1, and the receipt records status failed and failure_reason HTTP 503](images/alert-path-check.png)
+
+## Dedupe states
+
+A dedupe key moves through three states. Only full delivery confirms it, so a failed page cannot
+suppress the next attempt:
+
+```mermaid
+stateDiagram-v2
+    [*] --> claim: first sender claims
+    claim --> confirmed: every sink delivered
+    claim --> [*]: any sink failed (released)
+    claim --> [*]: claim older than 30s (abandoned)
+    confirmed --> [*]: dedupe window elapsed (default 600s)
+    note right of claim
+        a live claim or a confirmed key
+        makes other senders skip
+        (receipt status dedup_skipped)
+    end note
+```
+
+Above the library, the instruments keep their own latches (`--reminder-seconds`, default six
+hours) that also advance only on delivery.
 
 ## Sinks
 
@@ -87,6 +147,12 @@ failure the fallback is for. Only attempting the write can tell you.
 **Why does a dedupe skip count as `success`?** Callers latch on `result.success`. Inside the
 dedupe window the condition was already delivered, so latching is correct. Use
 `result.delivered` when you need to know that *this* call reached every sink.
+
+**Why does a lost receipt not make `success` False?** `success` is what callers latch on. The
+page reached the human; failing it would page them again on every run until the disk is fixed.
+The loss is reported separately: stderr, `receipt_error`, `result.receipts_ok`, and
+`watchdog-alert`'s exit status. A dedupe file that cannot be used fails toward sending: the alert
+goes out without dedupe and `result.dedupe_error` says why.
 
 **Why is dry-run `success`?** So a watchdog run with alerts suppressed still behaves like a
 normal run. Dry-run never confirms a dedupe key, so it cannot consume the window of a real page.

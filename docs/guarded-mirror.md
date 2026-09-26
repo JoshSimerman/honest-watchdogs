@@ -46,6 +46,11 @@ The run is **refused** for a directory, and its previous mirror left byte-for-by
 
 The cost of a wrong refusal is one stale day. The cost of a wrong propagation is the data.
 
+![guarded-mirror mirrors a directory, then refuses the next run after three files are deleted without an index edit; the alert fires at critical and the mirror still holds all four files](images/guarded-mirror-refusal.png)
+
+<sub>Real output on Linux: three files deleted with the index untouched, the run refused at
+`critical`, and the mirror still holding all four files.</sub>
+
 ## Pipeline
 
 ```mermaid

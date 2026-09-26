@@ -15,6 +15,9 @@ mount-probe --mount-point /mnt/share --remediate --mount-command 'mount /mnt/sha
 Exit: `0` healthy, `1` absent / unresponsive / remediation failed, `2` misconfigured (the mount
 answers but `--known-file` does not exist), `3` UNKNOWN.
 
+It sends no alerts itself: the exit code and the JSON line are the report, so the scheduler that
+runs it decides what to do with a failure.
+
 ## Why not `ls`?
 
 | Check | What it proves |
@@ -39,18 +42,24 @@ a process in uninterruptible sleep on a dead mount may not die promptly.
 
 ```mermaid
 flowchart TD
-    A[local_control: mkdir+rmdir in a LOCAL dir,<br/>same bounded worker] -- fails or times out --> U[UNKNOWN: the instrument is broken]
-    A -- ok --> B[mount_entry: /proc/self/mountinfo or mount]
-    B -- unreadable --> U2[UNKNOWN]
-    B -- absent --> AB[absent]
-    B -- present --> C[readdir]
-    C --> D[mkdir_rmdir on the mount]
-    D --> E[read_known_file, if given]
-    E --> V{classify}
-    V -- only failure is ENOENT on known file --> M[misconfigured]
-    V -- any error or timeout --> UR[unresponsive]
-    V -- any unknown --> U3[UNKNOWN]
-    V -- all ok --> H[healthy]
+    A["local_control: mkdir+rmdir in a<br/>LOCAL dir, same bounded worker"] -- "fails or times out" --> U["UNKNOWN (exit 3):<br/>the instrument is broken"]
+    A -- ok --> B["mount_entry: /proc/self/mountinfo<br/>or mount"]
+    B -- "unreadable or empty" --> U
+    B -- "not listed" --> AB["absent (exit 1)"]
+    B -- present --> C["readdir"]
+    C --> D["mkdir_rmdir on the mount"]
+    D --> E["read_known_file, if given"]
+    E --> V{"classify"}
+    V -- "only ENOENT on known file" --> M["misconfigured (exit 2)"]
+    V -- "any error or timeout" --> UR["unresponsive (exit 1)"]
+    V -- "worker crashed" --> U
+    V -- "all ok" --> H["healthy (exit 0)"]
+    classDef bad fill:#fde2e1,stroke:#c0392b,color:#000
+    classDef unk fill:#fff4d6,stroke:#b7791f,color:#000
+    classDef ok fill:#e3f6e8,stroke:#2f855a,color:#000
+    class AB,UR bad
+    class U,M unk
+    class H ok
 ```
 
 Before touching the mount, the probe runs the **same** write operation through the **same**

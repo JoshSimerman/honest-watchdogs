@@ -5,10 +5,15 @@ The rules this module exists to enforce:
 * **"Sent" is not "delivered".** Every delivery attempt, successful or not, appends one JSON line
   to a dated receipt file. A receipt records what the receiver said (HTTP status, failure reason),
   not what the sender hoped.
-* **A receipt is never dropped.** A receipt directory on a wedged network mount does not raise,
-  it blocks. The write is bounded by a deadline, and on timeout or error the receipt goes to a
-  local fallback directory, marked ``receipt_degraded``. The deadline chooses a different
-  destination; it never chooses not to record.
+* **A receipt is never dropped silently.** A receipt directory on a wedged network mount does
+  not raise, it blocks. The write is bounded by a deadline, and on timeout or error the receipt
+  goes to a local fallback directory, marked ``receipt_degraded``, under the same deadline. If
+  that fails too, the receipt line itself is printed to stderr under ``ALERT RECEIPT LOST`` and
+  the delivery carries ``receipt_error``. The deadline chooses a different destination; it never
+  chooses not to record.
+* **Bookkeeping never stops delivery.** Every sink is attempted for every alert. A receipt that
+  cannot be written, a dedupe file that cannot be used, a sink that raises or returns garbage,
+  or a closed stderr is reported on the result, never raised out of the delivery loop.
 * **Dedupe latches only on successful delivery.** A dedupe key is *claimed* before delivery,
   *confirmed* only if every sink delivered, and *released* otherwise, so a failed page stays
   retryable instead of being silenced for the whole dedupe window.
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -153,6 +159,8 @@ class SinkDelivery:
     dry_run: bool = False
     http_status: int | None = None
     failure_reason: str = ""
+    receipt_path: Path | None = None
+    receipt_error: str = ""
 
     @property
     def status(self) -> str:
@@ -171,6 +179,7 @@ class AlertResult:
     dedupe_key: str
     deliveries: tuple[SinkDelivery, ...]
     receipt_path: Path
+    dedupe_error: str = ""
 
     @property
     def success(self) -> bool:
@@ -195,6 +204,17 @@ class AlertResult:
     @property
     def dedup_skipped(self) -> bool:
         return bool(self.deliveries) and all(d.dedup_skipped for d in self.deliveries)
+
+    @property
+    def receipts_ok(self) -> bool:
+        """Every delivery left a receipt in a file (primary or degraded fallback).
+
+        Separate from :attr:`success` on purpose: a delivered page whose receipt was lost must
+        still latch, or the next run pages the human again. The loss is reported on stderr and
+        by ``watchdog-alert``'s exit status instead.
+        """
+
+        return all(not d.receipt_error for d in self.deliveries)
 
 
 # --------------------------------------------------------------------------- sinks
@@ -480,11 +500,10 @@ def send_alert(
     if not dry_run and any(sink.live for sink in cfg.sinks):
         live_blocked = live_delivery_block_reason()
         if live_blocked is not None:
-            print(
+            _warn(
                 f"honest-watchdogs alerts: SUPPRESSED live delivery of "
                 f"{item.component}/{item.severity} -- {live_blocked}. "
-                f"Set {LIVE_DELIVERY_OPT_IN_ENV}=1 to deliver deliberately.",
-                file=sys.stderr,
+                f"Set {LIVE_DELIVERY_OPT_IN_ENV}=1 to deliver deliberately."
             )
 
     key = dedupe_key_for(item)
@@ -496,54 +515,53 @@ def send_alert(
 
     claim_token: str | None = None
     dedup_skipped = False
+    dedupe_errors: list[str] = []
     if not dry_run and cfg.dedup_window_seconds > 0:
         claim_token = uuid.uuid4().hex
-        dedup_skipped = _dedup_claim(
-            key, item.created_at, cfg.dedup_window_seconds, claim_token,
-            state_path=cfg.dedup_state_path, claim_ttl_seconds=ttl,
-        )
+        try:
+            dedup_skipped = _dedup_claim(
+                key, item.created_at, cfg.dedup_window_seconds, claim_token,
+                state_path=cfg.dedup_state_path, claim_ttl_seconds=ttl,
+            )
+        except Exception as exc:  # fail toward SENDING: no claim, no skip
+            claim_token = None
+            dedupe_errors.append(f"claim failed: {type(exc).__name__}: {exc}")
+            _warn(f"honest-watchdogs alerts: dedupe state unusable ({type(exc).__name__}: {exc}); "
+                  f"sending {key} without dedupe")
         if dedup_skipped:
             claim_token = None
 
+    # Nothing inside this loop may raise: every sink is attempted, and whatever goes wrong
+    # around a delivery (its receipt, a misbehaving sink) is recorded on that delivery instead.
     deliveries: list[SinkDelivery] = []
-    fully_delivered = False
-    try:
-        for sink in cfg.sinks:
-            if dedup_skipped:
-                delivery = SinkDelivery(sink=sink.name, success=True, dedup_skipped=True)
-            elif dry_run or (sink.live and live_blocked is not None):
-                delivery = SinkDelivery(sink=sink.name, success=True, dry_run=True)
-            else:
-                try:
-                    outcome = sink.deliver(item)
-                except Exception as exc:  # a sink that raises is a failed delivery, not a crash
-                    outcome = DeliveryOutcome(
-                        success=False, failure_reason=f"{type(exc).__name__}: {exc}"
-                    )
-                delivery = SinkDelivery(
-                    sink=sink.name,
-                    success=outcome.success,
-                    http_status=outcome.http_status,
-                    failure_reason=outcome.failure_reason,
-                )
-            append_receipt(
+    for sink in cfg.sinks:
+        delivery = _attempt(sink, item, dedup_skipped=dedup_skipped,
+                            dry=dry_run or (sink.live and live_blocked is not None))
+        try:
+            landed = append_receipt(
                 receipt_path,
                 _receipt_event(item, key, delivery, attempted_at, live=sink.live),
                 timeout=cfg.receipt_timeout_seconds,
                 fallback_dir=cfg.fallback_receipt_dir,
             )
-            deliveries.append(delivery)
-        fully_delivered = bool(deliveries) and all(
-            d.success and not d.dry_run for d in deliveries
-        )
-    finally:
-        if claim_token is not None:
-            if fully_delivered:
-                _dedup_confirm(key, item.created_at, cfg.dedup_window_seconds, claim_token,
-                               state_path=cfg.dedup_state_path, claim_ttl_seconds=ttl)
-            else:
-                _dedup_release(key, item.created_at, cfg.dedup_window_seconds, claim_token,
-                               state_path=cfg.dedup_state_path, claim_ttl_seconds=ttl)
+            receipt_error = "" if landed is not None else "receipt lost: primary and fallback failed"
+        except Exception as exc:  # belt and braces: append_receipt handles I/O itself
+            landed, receipt_error = None, f"receipt lost: {type(exc).__name__}: {exc}"
+            _warn(f"ALERT RECEIPT LOST: {receipt_error}")
+        deliveries.append(dataclasses.replace(delivery, receipt_path=landed,
+                                              receipt_error=receipt_error))
+
+    fully_delivered = bool(deliveries) and all(d.success and not d.dry_run for d in deliveries)
+    if claim_token is not None:
+        settle = _dedup_confirm if fully_delivered else _dedup_release
+        try:
+            settle(key, item.created_at, cfg.dedup_window_seconds, claim_token,
+                   state_path=cfg.dedup_state_path, claim_ttl_seconds=ttl)
+        except Exception as exc:
+            what = "confirm" if fully_delivered else "release"
+            dedupe_errors.append(f"{what} failed: {type(exc).__name__}: {exc}")
+            _warn(f"honest-watchdogs alerts: could not {what} dedupe key {key} "
+                  f"({type(exc).__name__}: {exc})")
 
     return AlertResult(
         severity=item.severity,
@@ -552,7 +570,37 @@ def send_alert(
         dedupe_key=key,
         deliveries=tuple(deliveries),
         receipt_path=receipt_path,
+        dedupe_error="; ".join(dedupe_errors),
     )
+
+
+def _attempt(sink: Sink, item: Alert, *, dedup_skipped: bool, dry: bool) -> SinkDelivery:
+    """One sink's delivery. Never raises: a sink that raises or returns garbage has failed."""
+
+    if dedup_skipped:
+        return SinkDelivery(sink=sink.name, success=True, dedup_skipped=True)
+    if dry:
+        return SinkDelivery(sink=sink.name, success=True, dry_run=True)
+    try:
+        outcome = sink.deliver(item)
+    except Exception as exc:  # a sink that raises is a failed delivery, not a crash
+        return SinkDelivery(sink=sink.name, success=False,
+                            failure_reason=f"{type(exc).__name__}: {exc}")
+    if not isinstance(outcome, DeliveryOutcome):
+        return SinkDelivery(sink=sink.name, success=False,
+                            failure_reason=f"sink returned {type(outcome).__name__}, "
+                            "not a DeliveryOutcome")
+    return SinkDelivery(sink=sink.name, success=outcome.success,
+                        http_status=outcome.http_status, failure_reason=outcome.failure_reason)
+
+
+def _warn(message: str) -> None:
+    """Print to stderr, but never let a closed or broken stderr stop delivery."""
+
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def dedupe_key_for(item: Alert) -> str:
@@ -632,14 +680,18 @@ def append_receipt(
     *,
     timeout: float = RECEIPT_WRITE_TIMEOUT_SECONDS,
     fallback_dir: Path = DEFAULT_FALLBACK_RECEIPT_DIR,
-) -> Path:
+) -> Path | None:
     """Append one receipt line; degrade to ``fallback_dir`` rather than hang or drop.
 
     The fallback trigger is a real bounded WRITE, never an existence check: on some systems a
     permission layer allows metadata while denying content, so ``path.exists()`` returns True
     under exactly the failure the fallback exists for. Only attempting the write can tell you.
 
-    Returns the path the receipt actually landed in.
+    The fallback write has the same deadline. If it fails as well, the receipt line itself goes
+    to stderr under ``ALERT RECEIPT LOST`` and this returns None. It never raises for I/O: a
+    receipt is bookkeeping about a delivery and must not stop the next one.
+
+    Returns the path the receipt actually landed in, or None if it landed in no file.
     """
 
     line = json.dumps(event, sort_keys=True, separators=(",", ":"), default=str).encode() + b"\n"
@@ -648,24 +700,29 @@ def append_receipt(
             _write_line(path, line)
         return path
     except (ReceiptWriteTimeout, OSError) as exc:
-        degraded = dict(event)
-        degraded["receipt_degraded"] = True
-        degraded["receipt_intended_path"] = str(path)
-        degraded["receipt_degrade_reason"] = f"{type(exc).__name__}: {exc}"
-        fallback_path = Path(fallback_dir).expanduser() / path.name
-        # Loud as well: a receipt written somewhere nobody looks is the same defect as a
-        # detector nobody reads.
-        print(
-            f"ALERT RECEIPT DEGRADED: {path} unwritable ({type(exc).__name__}); "
-            f"wrote {fallback_path} instead",
-            file=sys.stderr,
-        )
-        _write_line(
-            fallback_path,
-            json.dumps(degraded, sort_keys=True, separators=(",", ":"), default=str).encode()
-            + b"\n",
-        )
-        return fallback_path
+        primary_type = type(exc).__name__
+        primary_error = f"{primary_type}: {exc}"
+    degraded = dict(event)
+    degraded["receipt_degraded"] = True
+    degraded["receipt_intended_path"] = str(path)
+    degraded["receipt_degrade_reason"] = primary_error
+    degraded_line = (json.dumps(degraded, sort_keys=True, separators=(",", ":"), default=str)
+                     .encode() + b"\n")
+    fallback_path = Path(fallback_dir).expanduser() / path.name
+    try:
+        with _deadline(timeout):
+            _write_line(fallback_path, degraded_line)
+    except (ReceiptWriteTimeout, OSError) as exc:
+        # Both files failed. stderr is the last record left, so the receipt goes there in full.
+        _warn(f"ALERT RECEIPT LOST: {path} ({primary_type}) and fallback {fallback_path} "
+              f"({type(exc).__name__}) both unwritable; the receipt follows")
+        _warn(degraded_line.decode().rstrip("\n"))
+        return None
+    # Loud as well: a receipt written somewhere nobody looks is the same defect as a
+    # detector nobody reads.
+    _warn(f"ALERT RECEIPT DEGRADED: {path} unwritable ({primary_type}); "
+          f"wrote {fallback_path} instead")
+    return fallback_path
 
 
 def _receipt_event(
@@ -771,9 +828,8 @@ def _locked_state(path: Path) -> Iterator[tuple[int, OrderedDict[str, _DedupEntr
             # keep the unreadable file for inspection before it is rewritten, and say so.
             keep = path.with_name(path.name + ".corrupt")
             keep.write_bytes(raw)
-            print(f"honest-watchdogs alerts: dedupe state {path} was unreadable; preserved it as "
-                  f"{keep} and continued with an empty table (alerts are not suppressed)",
-                  file=sys.stderr)
+            _warn(f"honest-watchdogs alerts: dedupe state {path} was unreadable; preserved it as "
+                  f"{keep} and continued with an empty table (alerts are not suppressed)")
         yield fd, _entries_from_json(text)
     finally:
         try:
@@ -987,8 +1043,8 @@ def _float(source: Mapping[str, str], key: str, default: float) -> float:
 def main(argv: list[str] | None = None) -> int:
     """Send one alert through the configured sinks: a positive control for the alert path.
 
-    Exit 0 if every sink delivered (or dry-ran with --dry-run), 1 if any sink failed,
-    2 if the configuration is invalid.
+    Exit 0 if every sink delivered (or dry-ran with --dry-run) and every receipt was written,
+    1 if any sink failed or any receipt was lost, 2 if the configuration is invalid.
     """
 
     parser = argparse.ArgumentParser(
@@ -1018,12 +1074,15 @@ def main(argv: list[str] | None = None) -> int:
         "receipt_path": str(result.receipt_path),
         "deliveries": [
             {"sink": d.sink, "status": d.status, "http_status": d.http_status,
-             "failure_reason": d.failure_reason or None}
+             "failure_reason": d.failure_reason or None,
+             "receipt": str(d.receipt_path) if d.receipt_path else None,
+             "receipt_error": d.receipt_error or None}
             for d in result.deliveries
         ],
+        "dedupe_error": result.dedupe_error or None,
     }
     print(json.dumps(report, sort_keys=True), file=sys.stdout if args.json else sys.stderr)
-    return EXIT_OK if result.success else EXIT_FINDINGS
+    return EXIT_OK if result.success and result.receipts_ok else EXIT_FINDINGS
 
 
 if __name__ == "__main__":
