@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "honest-watchdogs"
+version = "1.0.0"
+description = "Monitoring instruments that prove they can fire: distinct UNKNOWN exits, declared-schedule checks, truncation guards, bounded-write mount probes and alert delivery receipts."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Josh Simerman" }]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Monitoring",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+launchd-wedge-watch = "honest_watchdogs.wedge_watch:main"
+launchd-crash-loop-watch = "honest_watchdogs.crash_loop_watch:main"
+systemd-timer-liveness = "honest_watchdogs.timer_liveness:main"
+guarded-mirror = "honest_watchdogs.guarded_mirror:main"
+mount-probe = "honest_watchdogs.mount_probe:main"
+watchdog-alert = "honest_watchdogs.alerts:main"
+
+[tool.setuptools]
+packages = ["honest_watchdogs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
